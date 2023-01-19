@@ -1,11 +1,12 @@
 import asyncio
 
 from Strategy.tutci import TutciStrategy
+from Strategy.supertrend import SupertrendStrategy
 from configs.config import config
 
 
 async def main():
-    strategy = TutciStrategy(config)
+    strategy = SupertrendStrategy(config)
     await strategy.run()
 
 

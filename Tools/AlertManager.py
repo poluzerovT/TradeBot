@@ -9,7 +9,7 @@ class AlertManager:
         self.token = config['telegram']['token']
         self.chat_id = config['telegram']['chat_id']
         self.bot = telebot.TeleBot(self.token)
-    
+
     def send_message(self, msg, title=None):
         if isinstance(msg, dict):
             msg = json.dumps(msg, indent=4)

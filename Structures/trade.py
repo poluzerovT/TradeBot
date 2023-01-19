@@ -1,27 +1,10 @@
-import json
 from dataclasses import dataclass
-from typing import Optional
-from enum import Enum
+from Structures.common import *
 
 
-class Side(Enum):
-    LONG = 'LONG'
-    SHORT = 'SHORT'
-
-class Action(Enum):
-    SELL = 'SELL'
-    BUY = 'BUY'
-
-class OrderType(Enum):
-    MARKET = 'MARKET'
-    LIMIT = 'LIMIT'
-
-
-class TradingMode(Enum):
-    ISOLATED = 'ISOLATED'
-    CROSS = 'CROSS'
-    CASH = 'CASH'
-
+class TargetCcy(Enum):
+    BASE_CCY = 'base_ccy'
+    QUOTE_CCY = 'quote_ccy'
 
 @dataclass
 class Order:
@@ -31,6 +14,7 @@ class Order:
     trading_mode: TradingMode
     order_type: OrderType
     posSide: Side = None
+    target_ccy: TargetCcy = None
 
 
 @dataclass

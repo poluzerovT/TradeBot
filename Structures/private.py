@@ -3,18 +3,19 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from typing import Optional, List
+from Structures.common import *
 
-from Structures.trade import Action, Side
 
-class InstrumentType(Enum):
-    SPOT = 'SPOT'
-    MARGIN = 'MARGIN'
-    SWAP = 'SWAP'
 
 @dataclass
 class CoinBalance:
     ccy: str
     equity: float
+    equity_usd: float
+
+    @property
+    def ticker(self):
+        return self.ccy + '-USDT'
 
 @dataclass
 class Account:
@@ -30,10 +31,6 @@ class Position:
     size: float
     upl: float
 
-@dataclass
-class Positions:
-    positions: List[Position]
-    datetime: datetime
 
 @dataclass
 class FillOrder:
