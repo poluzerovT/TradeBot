@@ -18,7 +18,6 @@ logger = Logger(__name__).logger
 
 def markovitz_portfolio(r, sigma, theta, tickers=None):
     tickers = tickers or range(r.shape[0])
-
     if isinstance(r, pd.Series):
         r = r.values
     if isinstance(sigma, pd.Series):
@@ -28,7 +27,7 @@ def markovitz_portfolio(r, sigma, theta, tickers=None):
     ret = r.T @ w
     risk = cp.quad_form(w, sigma)
 
-    constraints = [cp.sum(w) == 1, w >= 0]
+    constraints = [cp.norm(w, 1) <= 1]
 
     prob = cp.Problem(
         cp.Maximize(ret - theta * risk),
@@ -47,7 +46,8 @@ class MarkowitzStrategy(StrategyBase):
         super().__init__(config, __name__, debug)
 
         self.min_balance = 8
-        self.trade_amount = 10
+        self.trade_amount = 5
+        self.leverage = 5
         self.theta = 10
         self.quote_ccy = 'USDT'
 
@@ -56,20 +56,18 @@ class MarkowitzStrategy(StrategyBase):
 
         self.candle_history: Dict[str: deque[Candle]] = {}
         self.instruments_info = {}
-        self.candle_history_length = 30
-        self.positions: List[Position] = None
+        self.candle_history_length = 5
+        self.positions: Dict[str: Position] = {}
         self.account: Account = None
 
         self.active_orders = []
 
         self.add_sequent_task(self.set_candles_history)
-        self.add_sequent_task(self.set_instrument_info)
         self.add_parallel_task(self.monitor)
 
     async def monitor(self):
         while self.account is None and self.positions is None:
             await asyncio.sleep(5)
-
         logger.warning(f'Monitor started')
         while True:
             if self.account:
@@ -78,7 +76,7 @@ class MarkowitzStrategy(StrategyBase):
                 logger.info(f'{self.positions}')
             if self.active_orders:
                 logger.warning(f'Active orders: {self.active_orders}')
-            await asyncio.sleep(60 * 15)
+            await asyncio.sleep(60 * 1)
 
     async def set_candles_history(self):
         for ccy in self.ccys:
@@ -89,7 +87,7 @@ class MarkowitzStrategy(StrategyBase):
     async def set_instrument_info(self):
         for ccy in self.ccys:
             self.instruments_info[ccy] = await self.connection.get_instrument_info(
-                inst_type=InstrumentType.SPOT,
+                inst_type=InstrumentType.MARGIN,
                 inst_id=ccy,
             )
         logger.warning(f'Min position: \n{self.instruments_info}')
@@ -106,92 +104,105 @@ class MarkowitzStrategy(StrategyBase):
             logger.warning(f'Waiting for filling orders: {self.active_orders}')
 
     async def rebuild_portfolio(self, portfolio, prices):
-        portfolio_usd = portfolio * self.trade_amount
         orders = {
-            Action.SELL: [],
-            Action.BUY: []
+            'close': [],
+            'open': []
         }
         for ccy in self.ccys:
-            price = prices[ccy]
-            min_size = self.instruments_info[ccy].min_size
-            min_size_usd = min_size * price
-            new_pos_usd = portfolio_usd[ccy]
-
-            order = None
-            if ccy in self.account.coins:
-                coin = self.account.coins[ccy]
-                diff = new_pos_usd - coin.equity_usd
-                # print(
-                #     f'coin: {coin},'
-                #     f'new_pos_usd: {new_pos_usd}',
-                #     f'min_size: {min_size}',
-                #     f'min_size_usd: {min_size_usd}',
-                #     sep='\n')
-                if new_pos_usd < 0.01 < coin.equity:
-                    order = Order(
-                        action=Action.SELL,
-                        size=coin.equity,
-                        ticker=f'{ccy}-{self.quote_ccy}',
-                        trading_mode=TradingMode.CASH,
-                        order_type=OrderType.MARKET,
-                        target_ccy=TargetCcy.BASE_CCY,
-                    )
-                elif abs(diff) > 0.1:
-                    order = Order(
-                        action=Action(diff),
-                        size=abs(diff),
-                        ticker=f'{ccy}-{self.quote_ccy}',
-                        trading_mode=TradingMode.CASH,
-                        order_type=OrderType.MARKET,
-                        target_ccy=TargetCcy.QUOTE_CCY,
-                    )
-            else:
-                if new_pos_usd > min_size_usd:
+            position = self.positions.get(f'{ccy}-{self.quote_ccy}')
+            new_pos_usd = portfolio[ccy] * self.trade_amount
+            if position is None:
+                if new_pos_usd > 0.1:
                     order = Order(
                         action=Action.BUY,
-                        size=new_pos_usd,
+                        size=new_pos_usd * self.leverage,
                         ticker=f'{ccy}-{self.quote_ccy}',
-                        trading_mode=TradingMode.CASH,
+                        trading_mode=TradingMode.CROSS,
                         order_type=OrderType.MARKET,
-                        target_ccy=TargetCcy.QUOTE_CCY,
+                        margin_ccy=self.quote_ccy,
                     )
-            if order is not None:
-                orders[order.action].append(order)
-
-        for order in orders[Action.SELL]:
-            order_response = await self.connection.place_order(order)
-            if order_response.status == OrderStatus.OK:
-                self.active_orders.append(order)
-                logger.warning(f'placed SELL order: {order}')
+                    orders['open'].append(order)
+                elif new_pos_usd < -0.1:
+                    new_pos_size = new_pos_usd / prices[ccy]
+                    order = Order(
+                        action=Action.SELL,
+                        size=abs(new_pos_size) * self.leverage,
+                        ticker=f'{ccy}-{self.quote_ccy}',
+                        trading_mode=TradingMode.CROSS,
+                        order_type=OrderType.MARKET,
+                        margin_ccy=self.quote_ccy,
+                    )
+                    orders['open'].append(order)
             else:
+                # total licvidation
+                if abs(new_pos_usd) < 0.1:
+                    order = Order(
+                        action=Action.BUY if position.pos_ccy == self.quote_ccy else Action.SELL,
+                        size=position.pos_size * self.leverage,
+                        ticker=f'{ccy}-{self.quote_ccy}',
+                        trading_mode=TradingMode.CROSS,
+                        order_type=OrderType.MARKET,
+                        margin_ccy=self.quote_ccy,
+                    )
+                    orders['close'].append(order)
+                # partial close or open
+                else:
+                    diff_usd = new_pos_usd - position.notional_usd
+                    # dokupka
+                    if diff_usd > 0.1:
+                        order = Order(
+                            action=Action.BUY,
+                            size=diff_usd * self.leverage,
+                            ticker=f'{ccy}-{self.quote_ccy}',
+                            trading_mode=TradingMode.CROSS,
+                            order_type=OrderType.MARKET,
+                            margin_ccy=self.quote_ccy,
+                        )
+                        orders['open'].append(order)
+                    # prodazha
+                    elif diff_usd < 0.1:
+                        diff_size = diff_usd / prices[ccy]
+                        order = Order(
+                            action=Action.SELL,
+                            size=abs(diff_size) * self.leverage,
+                            ticker=f'{ccy}-{self.quote_ccy}',
+                            trading_mode=TradingMode.CROSS,
+                            order_type=OrderType.MARKET,
+                            margin_ccy=self.quote_ccy,
+                        )
+                        orders['close'].append(order)
+
+        for order in orders['close']:
+            self.active_orders.append(order)
+            logger.warning(f'placed SELL order: {order}')
+            order_response = await self.connection.place_order(order)
+            if order_response.status != OrderStatus.OK:
+                self.active_orders.remove(order)
                 logger.error(f'Invalid SELL order: {order}')
 
         await self.wait_orders_fill()
 
-        for order in orders[Action.BUY]:
+        for order in orders['open']:
+            self.active_orders.append(order)
+            logger.warning(f'placed BUY order: {order}')
             order_response = await self.connection.place_order(order)
-            if order_response.status == OrderStatus.OK:
-                self.active_orders.append(order)
-                logger.warning(f'placed BUY order: {order}')
-            else:
+            if order_response.status != OrderStatus.OK:
+                self.active_orders.remove(order)
                 logger.error(f'Invalid BUY order: {order}')
 
     async def trader(self):
         while True:
             df = self.close_prices_to_df()
             if df is not None:
-                # self.trade_amount = int(self.account.total_usd - self.account.in_coins_usd)
-                # logger.warning(f'Set trade ammount to {self.trade_amount}')
                 df_ret = (df.diff() / df.shift())
                 prices = df.iloc[-1]
-                r = df_ret.iloc[-1]
+                r = df_ret.mean(axis=0)
                 sigma = df_ret.cov()
                 portfolio, stats = markovitz_portfolio(r, sigma, self.theta, tickers=self.ccys)
-
                 logger.info(f'\nExpected return: \n{r}\nPortfolio: \n{portfolio}\nExpected stats: \n{stats}')
                 await self.rebuild_portfolio(portfolio, prices)
 
-            await asyncio.sleep(60 * 30)
+            await asyncio.sleep(60 * 60)
 
     async def update_candle_history(self, candle):
         ccy = candle.inst_id.replace(f'-{self.quote_ccy}', '')
@@ -219,7 +230,8 @@ class MarkowitzStrategy(StrategyBase):
             await self.exit()
 
     async def positions_handler(self, positions: List[Position]):
-        self.positions = positions
+        for pos in positions:
+            self.positions[pos.instrument_id] = pos
 
     async def fill_order_handler(self, fill_order: FillOrder):
         logger.info(f'Gor fill order: {fill_order}')

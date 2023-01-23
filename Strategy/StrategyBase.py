@@ -45,6 +45,15 @@ class StrategyBase:
             await asyncio.sleep(10)
         logger.error(f'Trader stopped.')
 
+
+    async def exit(self):
+
+        await self.connection.exit()
+        for task in self.tasks:
+            if not task.done():
+                task.cancel()
+
+
     async def run(self):
         await self.connection.run()
         for task in self.sequent_tasks:
@@ -59,7 +68,10 @@ class StrategyBase:
 
         self.alert_manager.send_message(f'Trader {self.name} started')
 
-        await asyncio.gather(*self.tasks, self.trader_task)
+        try:
+            await asyncio.gather(*self.tasks, self.trader_task)
+        except asyncio.CancelledError as e:
+            print("Stopped", e)
 
     def add_parallel_task(self, task):
         self.parallel_tasks.append(task)

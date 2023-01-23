@@ -17,15 +17,35 @@ class Trend(Enum):
     UP = 'UP'
     DOWN = 'DOWN'
 
+    def __repr__(self):
+        return repr(self.value)
+
+
+class EmaTrend:
+    def __init__(self, leng):
+        self.leng = leng
+        self.trend = None
+
+    def calculate(self, df: pd.DataFrame):
+        close = df['close']
+        ema = close.rolling(self.leng).mean()
+        ema_diff = ema.diff()
+        self.trend = Trend.UP if ema_diff.iloc[-1] > 0 else Trend.DOWN
+
+    def __repr__(self):
+        return repr(self.trend)
+
 
 class SupertrendStatus:
     def __init__(self, period, mul):
+        self.price_now = np.nan
         self.trend = None
-        self.trend_prev = self.trend
+        self.trend_prev = None
         self.up = np.nan
+        self.up_prev = np.nan
         self.low = np.nan
         self.low_prev = np.nan
-        self.up_prev = np.nan
+
         self.mul = mul
         self.period = period
 
@@ -36,12 +56,13 @@ class SupertrendStatus:
                 v = np.round(v, 3)
             res[k] = v
         return repr(res)
-        # return repr(self.__dict__)
 
     def trend_changed(self):
         return self.trend != self.trend_prev
 
-    def calc(self, row, new_candle):
+    def calc(self, row):
+        if row.shape[0] < self.period:
+            return
         high = row['high']
         low = row['low']
         close = row['close']
@@ -61,54 +82,70 @@ class SupertrendStatus:
         low = hl2 - (self.mul * atr)
 
         self.trend_prev = self.trend
-        if new_candle:
-            self.up_prev = self.up
-            self.low_prev = self.low
-
         self.up = float(up.iloc[-1])
         self.low = float(low.iloc[-1])
-
+        self.price_now = price_now
         if price_now > self.up_prev:
             if self.trend == Trend.DOWN:
                 self.trend = None
             else:
                 self.trend = Trend.UP
+
         elif price_now < self.low_prev:
             if self.trend == Trend.UP:
                 self.trend = None
             else:
                 self.trend = Trend.DOWN
-        else:
-            if (self.trend is None or self.trend == Trend.UP) and self.low < self.low_prev:
-                self.low = self.low_prev
-            if (self.trend is None or self.trend == Trend.DOWN) and self.up > self.up_prev:
-                self.up = self.up_prev
 
-        if self.trend == Trend.UP:
-            self.up = np.nan
+        if self.trend is None:
+            self.up_prev = min(self.up_prev, self.up) if not np.isnan(self.up_prev) else self.up
+            self.low_prev = max(self.low_prev, self.low) if not np.isnan(self.low_prev) else self.low
+
+        elif self.trend == Trend.UP:
+            self.up_prev = np.nan
+            self.low_prev = max(self.low_prev, self.low)
+
         elif self.trend == Trend.DOWN:
-            self.low = np.nan
+            self.up_prev = min(self.up_prev, self.up)
+            self.low_prev = np.nan
 
+    def to_dict(self):
+        res = {}
+        for k, v in self.__dict__.items():
+            if isinstance(v, float):
+                v = np.round(v, 3)
+            res[k] = v
+        return res
 
 class SupertrendStrategy(StrategyBase):
-    def __init__(self, config):
-        super().__init__(config, __name__)
-        self.new_candle = False
+    def __init__(self, config, debug=True):
+        super().__init__(config, __name__, debug)
         self.positions = None
         self.account = None
+        self.active_position = None
         self.trade_amount = config['supertrend']['trade_amount']
         self.trade_ticker = config['supertrend']['trade_ticker']
         self.trade_tf = config['supertrend']['timeframe']
         self.atr_period = config['supertrend']['atr_period']
         self.mult = config['supertrend']['mult']
+        self.ema_leng = 60
 
         self.candle_history: deque[Candle] = deque()
-        self.candle_history_length = self.atr_period
+        self.candle_history_length = max(self.atr_period, self.ema_leng) + 2
         self.current_candle_start = None
-        self.add_parallel_task(self.trader)
+        self.add_sequent_task(self.set_candles_history)
+
 
     def candles_history_df(self):
         return pd.DataFrame(self.candle_history)
+
+    async def set_candles_history(self):
+        self.candle_history = deque(
+            await self.connection.get_history_candles(
+                ticker=self.trade_ticker,
+                tf=self.trade_tf,
+                num_bars=self.candle_history_length)
+        )
 
     def _close_long_order(self):
         order = Order(
@@ -151,63 +188,81 @@ class SupertrendStrategy(StrategyBase):
         return order
 
     async def trader(self):
-        while self.candle_history is None:
-            await asyncio.sleep(5)
         self.supertrend_status = SupertrendStatus(self.atr_period, self.mult)
-
+        self.ema_trend = EmaTrend(self.ema_leng)
         logger.warning(f'Trader started')
-        self.alert_manager.send_message(f'Trader started')
 
         while True:
-            await asyncio.sleep(10)
+            await asyncio.sleep(15)
             candles_df = self.candles_history_df()
-            self.supertrend_status.calc(candles_df, self.new_candle)
-            self.new_candle = False
+            self.supertrend_status.calc(candles_df)
+            self.ema_trend.calculate(candles_df)
 
-            logger.info(self.supertrend_status)
+            logger.info(f'{self.supertrend_status}, {self.ema_trend}')
 
             if self.supertrend_status.trend_changed():
-                # logger.warning(f'Trend changed: {self.supertrend_status}')
-                if self.supertrend_status.trend_prev == Trend.UP:
-                    await self.connection.place_order(self._close_long_order())
-                elif self.supertrend_status.trend_prev == Trend.DOWN:
-                    await self.connection.place_order(self._close_short_order())
+                logger.warning(f'Trend changed. Global: {self.ema_trend}. Supertrend:{self.supertrend_status.trend}')
+                # close position
+                if self.active_position is not None:
+                    # if self.supertrend_status.trend_prev == Trend.UP:
+                    if self.active_position.side == Side.LONG:
+                        order = self._close_long_order()
+                        resp = await self.connection.place_order(order)
+                        if resp.status != OrderStatus.OK:
+                            logger.error(f'Cant close long position: {order}, {resp}')
 
-                if self.supertrend_status.trend == Trend.UP:
-                    await self.connection.place_order(self._open_long_order())
-                elif self.supertrend_status.trend == Trend.DOWN:
-                    await self.connection.place_order(self._open_short_order())
+                    elif self.active_position.side == Side.SHORT:
+                    # elif self.supertrend_status.trend_prev == Trend.DOWN:
+                        order = self._close_short_order()
+                        resp = await self.connection.place_order()
+                        if resp.status != OrderStatus.OK:
+                            logger.error(f'Cant close short position: {order}, {resp}')
+
+                # open if both trends in same direction
+                if self.supertrend_status.trend == Trend.UP and self.ema_trend.trend == Trend.UP:
+                    order = self._open_long_order()
+                    resp = await self.connection.place_order(order)
+                    if resp.status != OrderStatus.OK:
+                        logger.error(f'Cant open long position: {order}, {resp}')
+                elif self.supertrend_status.trend == Trend.DOWN and self.ema_trend.trend == Trend.DOWN:
+                    order = self._open_short_order()
+                    resp = await self.connection.place_order(order)
+                    if resp.status != OrderStatus.OK:
+                        logger.error(f'Cant open short position: {order}, {resp}')
+
 
     async def update_candle_history(self, candle):
-        if self.current_candle_start is None:
-            self.current_candle_start = candle.datetime
-            self.candle_history = deque(
-                await self.connection.get_history_candles(ticker=self.trade_ticker, tf=self.trade_tf,
-                                                          num_bars=self.candle_history_length - 1))
-            self.candle_history.append(candle)
-        if self.current_candle_start == candle.datetime:
+        if self.candle_history is None:
+            raise RuntimeError(f'Empty candle history')
+
+        if self.candle_history[-1].datetime == candle.datetime:
             self.candle_history[-1] = candle
-        elif self.current_candle_start != candle.datetime:
-            self.new_candle = True
-            self.current_candle_start = candle.datetime
+
+        elif self.candle_history[-1].datetime != candle.datetime:
             self.candle_history.append(candle)
             if len(self.candle_history) > self.candle_history_length:
                 self.candle_history.popleft()
 
     async def candle_handler(self, candle: Candle):
-        await self.update_candle_history(candle)
+        if candle.inst_id == self.trade_ticker:
+            await self.update_candle_history(candle)
 
-    def account_handler(self, account: Account):
+    async def account_handler(self, account: Account):
         self.account = account
 
-    def positions_handler(self, positions: Positions):
-        self.positions = positions
+    async def positions_handler(self, positions: List[Position]):
+        self.active_position = None
+        for position in positions:
+            if position.instrument_id == self.trade_ticker and position.pos_size == self.trade_amount:
+                self.active_position = position
+                logger.warning(f'Position update: {position}')
 
-    def order_response_handler(self, order_response: OrderResponse):
+
+    async def order_response_handler(self, order_response: OrderResponse):
         self.alert_manager.send_message(order_response, title='order response')
         logger.info(f'Gor order response: {order_response}')
         pass
 
-    def fill_order_handler(self, fill_order: FillOrder):
+    async def fill_order_handler(self, fill_order: FillOrder):
         self.alert_manager.send_message(fill_order, title='fill order')
         logger.info(f'Gor fill order: {fill_order}')

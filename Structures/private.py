@@ -1,8 +1,8 @@
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Optional, List
+from typing import Optional, List, Dict
 from Structures.common import *
 
 
@@ -13,27 +13,29 @@ class CoinBalance:
     equity: float
     equity_usd: float
 
-    @property
-    def ticker(self):
-        return self.ccy + '-USDT'
-
 @dataclass
 class Account:
-    coins: List[CoinBalance]
     datetime: datetime
     total_usd: float
+    in_coins_usd: float
+    coins: Dict #= field(default_factory=lambda: {})
 
 @dataclass
 class Position:
     side: Side
-    ccy: str
+    margin_ccy: str
     instrument_type: InstrumentType
-    size: float
+    instrument_id: str
+    pos_size: float
+    pos_ccy: str
+    notional_usd: float
     upl: float
+
 
 
 @dataclass
 class FillOrder:
+    id: str
     ticker: str
     inst_type: InstrumentType
     posSide: Side
@@ -41,7 +43,7 @@ class FillOrder:
     size: float
     fill_price: float
     fill_time: datetime
-    state: str ##
+    state: FillStatus
     leverage: float
     fee: float
     pnl: float

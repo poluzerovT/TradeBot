@@ -25,8 +25,6 @@ class Method(Enum):
     SET = 'SET'
 
 
-def id_generator():
-    return str(int(random.random() * 1000000) % 1000000)
 
 
 async def handle_rest_response(result: aiohttp.ClientResponse) -> Dict:
@@ -95,14 +93,14 @@ class OkxConnection:
             obj = self._object_from_json_private(msg_json)
             self.queue.put_nowait(obj)
 
-    async def _listen_to_trade_ws(self):
-        while True:
-            message = await self.trade_ws.recv()
-            if message == 'pong':
-                continue
-            msg_json = json.loads(message)
-            obj = self._object_from_json_trade(msg_json)
-            self.queue.put_nowait(obj)
+    # async def _listen_to_trade_ws(self):
+    #     while True:
+    #         message = await self.trade_ws.recv()
+    #         if message == 'pong':
+    #             continue
+    #         msg_json = json.loads(message)
+    #         obj = self._object_from_json_trade(msg_json)
+    #         self.queue.put_nowait(obj)
 
     # JSON TO STRUCTURES CONVERTERS
     def _candle_from_json(self, msg: Dict, **params) -> Any:
@@ -135,21 +133,24 @@ class OkxConnection:
         return candles[0]
 
     def _positions_from_json(self, msg: Dict) -> List[Position]:
+        # print(f'Position: \n{msg}')
         positions = []
         for data in msg['data']:
             pos = Position(
-                side=Side.LONG if data['posSide'] == 'long' else Side.SHORT,
-                ccy=data['ccy'],
-                instrument_type=InstrumentType.SWAP,
-                size=float(data['pos']),
-                upl=float(data['upl'])
+                side=Side(data['posSide']),
+                margin_ccy=data['ccy'],
+                instrument_type=InstrumentType(data['instType']),
+                instrument_id=data['instId'],
+                pos_size=float(data['pos']),
+                pos_ccy=data['posCcy'],
+                notional_usd=float(data['notionalUsd']) if data['notionalUsd'] else None,
+                upl=float(data['upl']) if data['upl'] else None
             )
             positions.append(pos)
         return positions
 
     def _account_from_json(self, msg: Dict) -> Account:
-        print(msg)
-        coins = []
+        coins = {}
         timestamp_ms = int(msg['data'][0]['uTime'])
         dt = datetime.fromtimestamp(timestamp_ms // 1000)
         total_usd = 0
@@ -159,29 +160,46 @@ class OkxConnection:
                 equity=float(data['eq']),
                 equity_usd=float(data['eqUsd'])
             )
-            total_usd += float(data['eq'])
-            coins.append(coin)
-        return Account(coins=coins, datetime=dt, total_usd=total_usd)
+            total_usd += float(data['eqUsd'])
+            coins[coin.ccy] = coin
+
+        usdt = coins.get('USDT').equity if 'USDT' in coins.keys() else 0
+        return Account(coins=coins, datetime=dt, total_usd=total_usd, in_coins_usd=total_usd - usdt)
 
     def _order_response_from_json(self, msg: Dict) -> OrderResponse:
         return OrderResponse(
             op=msg['op'],
-            order_id=msg['data'][0]['ordId'],
+            order_id=msg['id'],
             status=OrderStatus.OK if msg['code'] == '0' else OrderStatus.ERROR,
-            data=msg['data']
+            # data=msg['data']
         )
+
+    def _multiple_order_response_from_json(self, msg: Dict) -> List[OrderResponse]:
+        order_responses = []
+        op = msg['op']
+        id = msg['id']
+        for d in msg['data']:
+            order_response = OrderResponse(
+                op=op,
+                order_id=id,
+                status=OrderStatus.OK if msg['code'] == '0' else OrderStatus.ERROR,
+                # data=msg['data']
+            )
+            order_responses.append(order_response)
+        return order_responses
 
     def _fill_order_from_json(self, msg: Dict) -> FillOrder:
         data = msg['data'][0]
         fill_order = FillOrder(
+            id=data['clOrdId'],
             ticker=data['instId'],
-            inst_type=InstrumentType.SWAP,
+            inst_type=InstrumentType(data['instType']),
             posSide=Side.LONG if data['posSide'] == 'long' else Side.SHORT if data['posSide'] == 'short' else None,
             action=Action.BUY if data['side'] == 'buy' else Action.SELL,
             size=float(data['sz']),
             fill_price=float(data['fillPx']) if data['fillPx'] else None,
             fill_time=datetime.fromtimestamp(int(data['fillTime']) // 1000) if data['fillTime'] else None,
-            state=data['state'],
+            state=FillStatus(data['state']),
             leverage=float(data['lever']) if data['lever'] else None,
             fee=float(data['fee']) if data['fee'] else None,
             pnl=float(data['pnl']) if data['pnl'] else None,
@@ -196,7 +214,8 @@ class OkxConnection:
             inst_type=InstrumentType(data['instType']),
             inst_id=data['instId'],
             contract_value=float(data['ctVal']) if data['ctVal'] else None,
-            min_size=float(data['minSz'])
+            min_size=float(data['minSz']),
+            tick_size=float(data['tickSz']) if data['tickSz'] else None
         )
         return instrument_info
 
@@ -209,18 +228,49 @@ class OkxConnection:
         tgtCcy_map = {TargetCcy.BASE_CCY: 'base_ccy', TargetCcy.QUOTE_CCY: 'quote_ccy'}
 
         msg = {
-            "id": id_generator(),
+            "id": order.id,
             "op": "order",
             "args": [
                 {
                     "side": action_map[order.action],
+                    "sz": order.size,
                     "instId": order.ticker,
                     "tdMode": tdMode_map[order.trading_mode],
                     "ordType": ordType_map[order.order_type],
-                    "sz": order.size,
-                    "tgtCcy": tgtCcy_map[order.target_ccy],
+                    "clOrdId": order.id,
+
+                    "tgtCcy": tgtCcy_map[order.target_ccy] if order.target_ccy else None,
+                    'ccy': order.margin_ccy,
                 }
             ]
+        }
+        for k, v in msg.items():
+            if v is None:
+                msg.pop(k)
+
+        return json.dumps(msg, separators=(",", ":"))
+
+    def _multiple_orders_to_json(self, orders: List[Order]):
+        pos_side_map = {Side.LONG: 'long', Side.SHORT: 'short'}
+        action_map = {Action.BUY: 'buy', Action.SELL: 'sell'}
+        tdMode_map = {TradingMode.CROSS: 'cross', TradingMode.ISOLATED: 'isolated', TradingMode.CASH: 'cash'}
+        ordType_map = {OrderType.MARKET: 'market', OrderType.LIMIT: 'limit'}
+        tgtCcy_map = {TargetCcy.BASE_CCY: 'base_ccy', TargetCcy.QUOTE_CCY: 'quote_ccy'}
+        args = []
+        for order in orders:
+            arg = {
+                "side": action_map[order.action],
+                "instId": order.ticker,
+                "tdMode": tdMode_map[order.trading_mode],
+                "ordType": ordType_map[order.order_type],
+                "sz": order.size,
+                "tgtCcy": tgtCcy_map[order.target_ccy],
+            }
+            args.append(arg)
+        msg = {
+            "id": id_generator(),
+            "op": "batch-orders",
+            "args": args
         }
         return json.dumps(msg, separators=(",", ":"))
 
@@ -257,7 +307,7 @@ class OkxConnection:
             if channel == 'account':
                 obj = self._account_from_json(msg)
             elif channel == 'positions':
-                obj = self._positions_from_json(msg)  # Positions().from_json(msg)
+                obj = self._positions_from_json(msg)
             elif channel == 'orders':
                 obj = self._fill_order_from_json(msg)
             else:
@@ -266,28 +316,33 @@ class OkxConnection:
             logger.error(f'Private processing object error: \n{msg}\n{e}', )
         return obj
 
-    def _object_from_json_trade(self, msg: Dict) -> Any:
-        op = msg['op']
-        obj = None
-        try:
-            if op in ['order', 'cancel-order']:
-                obj = self._order_response_from_json(msg)
-            else:
-                logger.error(f'Unknown message TRADE: {msg}')
-        except Exception as e:
-            logger.error(f'Trade processing object error: \n{msg}\n{e}', )
-        return obj
-
     # TRADE API
-    async def place_order(self, order: Order):
+    async def place_order(self, order: Order) -> OrderResponse:
         if not self.debug:
             await self.trade_ws.send(self._order_to_json(order))
+            response = await self.trade_ws.recv()
+            response = json.loads(response)
+            order_response = self._order_response_from_json(response)
+            return order_response
         logger.debug(f'Placing order: {order}')
+        return OrderResponse(OrderStatus.ERROR)
+
+    async def place_multiple_orders(self, orders: List[Order]):
+        if not self.debug:
+            await self.trade_ws.send(self._multiple_orders_to_json(orders))
+            response = await self.trade_ws.recv()
+            response = json.loads(response)
+            orders_response = self._multiple_order_response_from_json(response)
+            return orders_response
+        logger.debug(f'Placing multiple order: {orders}')
 
     async def cancel_order(self, order_cancel: OrderCancel):
         await self.trade_ws.send(self._order_cancel_to_json(order_cancel))
 
     # ACC API
+    async def set_leverage(self, inst_id: str, leverage: int, margin_mode: TradingMode):
+        await self._set_leverage(instId=inst_id, lever=leverage, mgnMode=margin_mode)
+
     async def get_history_candles(self, ticker: str, tf: str, num_bars: int):
         candles = []
         for i in range((num_bars // 100) + 1):
@@ -296,7 +351,7 @@ class OkxConnection:
             candles.extend(candle[::-1])
         return candles[-num_bars:]
 
-    async def get_instrument_info(self, inst_type: InstrumentType, uly: str=None, inst_id: str=None):
+    async def get_instrument_info(self, inst_type: InstrumentType, uly: str = None, inst_id: str = None):
         msg = None
         if inst_type == InstrumentType.SPOT:
             msg = await self._rest_get_instrument_info(instType=inst_type.value, inst_id=inst_id)
@@ -308,6 +363,18 @@ class OkxConnection:
             return instrument_info
 
     # REST API
+    async def _place_order(self, **params):
+        if self.debug:
+            logger.warning(f'Placing order: {params}')
+            return
+        return await self._signed_rest_request(
+            Method.POST, "/api/v5/trade/order", params=params
+        )
+
+    async def _set_leverage(self, **params):
+        """https://www.okx.com/docs-v5/en/#rest-api-account-set-leverage"""
+        return await self._signed_rest_request(Method.POST, "/api/v5/account/set-leverage", params=params)
+
     async def _rest_get_history_candles(self, **params) -> Dict:
         """https://www.okx.com/docs-v5/en/#rest-api-market-data-get-candlesticks-history"""
         return await self._signed_rest_request(Method.GET, "/api/v5/market/history-candles", params=params)
@@ -439,6 +506,8 @@ class OkxConnection:
     async def _ping_trade_ws(self):
         while True:
             await self.trade_ws.send('ping')
+            resp = await self.trade_ws.recv()
+            # logger.warning(f'GOT PIGN RESPONSE: {resp}')
             await asyncio.sleep(20)
 
     async def _setup(self):
@@ -451,10 +520,20 @@ class OkxConnection:
         self.listening_tasks = [
             asyncio.create_task(self._listen_to_public_ws()),
             asyncio.create_task(self._listen_to_private_ws()),
-            asyncio.create_task(self._listen_to_trade_ws()),
+            # asyncio.create_task(self._listen_to_trade_ws()),
             asyncio.create_task(self._ping_trade_ws()),
         ]
 
     async def run(self):
         await self._setup()
-        self.reconnect_task = asyncio.create_task(self._periodicaly_reconnect())
+        # self.reconnect_task = asyncio.create_task(self._periodicaly_reconnect())
+
+    async def exit(self):
+        await self.rest_session.close()
+        for ws in [self.public_ws, self.private_ws, self.trade_ws]:
+
+            await ws.close()
+        for task in [*self.listening_tasks, self.reconnect_task]:
+            if not task.done():
+                task.cancel()
+
