@@ -23,6 +23,7 @@ def crossover(x, y):
 def tutci_online(data: DataFrame, entr_length=20, exit_length=10):
     high = data['high']
     low = data['low']
+    close = data['close']
 
     up = high.rolling(window=entr_length).max()
     down = low.rolling(window=entr_length).min()
@@ -30,12 +31,21 @@ def tutci_online(data: DataFrame, entr_length=20, exit_length=10):
     sup = high.rolling(window=exit_length).max()
     sdown = low.rolling(window=exit_length).min()
 
-    buy_signal = (high == up.shift()) | crossover(high, up.shift())
-    sell_signal = (low == down.shift()) | crossover(down.shift(), low)
-    buy_exit = (low == sdown.shift()) | crossover(sdown.shift(), low)
-    sell_exit = (high == sup.shift()) | crossover(high, sup.shift())
+    buy_signal = close >= up.shift()
+    sell_signal = close <= down.shift()#(close == down.shift()) | crossover(down.shift(), close)
+    buy_exit = close <= sdown.shift()#(close == sdown.shift()) | crossover(sdown.shift(), close)
+    sell_exit = close >= sup.shift()#(close == sup.shift()) | crossover(close, sup.shift())
 
-    return bool(buy_signal.iloc[-1]), bool(sell_signal.iloc[-1]), bool(buy_exit.iloc[-1]), bool(sell_exit.iloc[-1])
+    # buy_signal = (high == up.shift()) | crossover(high, up.shift())
+    # sell_signal = (low == down.shift()) | crossover(down.shift(), low)
+    # buy_exit = (low == sdown.shift()) | crossover(sdown.shift(), low)
+    # sell_exit = (high == sup.shift()) | crossover(high, sup.shift())
+    return {
+        'long_enter': bool(buy_signal.iloc[-1]),
+        'short_enter': bool(sell_signal.iloc[-1]),
+        'long_exit': bool(buy_exit.iloc[-1]),
+        'short_exit': bool(sell_exit.iloc[-1])
+    }
 
 
 class TutciStatus:
@@ -81,6 +91,7 @@ class TutciStrategy(StrategyBase):
         self.tutci_status = None
         self.trade_amount = config['tutci']['trade_amount']
         self.trade_ticker = config['tutci']['trade_ticker']
+        self.trade_tf = config['tutci']['timeframe']
         self.enter_length = config['tutci']['enter_length']
         self.exit_length = config['tutci']['exit_length']
 
@@ -88,8 +99,8 @@ class TutciStrategy(StrategyBase):
         self.candle_history_length = self.enter_length + 1
         self.current_candle_start = None
 
-        self.add_pretask(self.trader)
-        self.add_pretask(self.notifier)
+        self.add_parallel_task(self.trader)
+        # self.add_pretask(self.notifier)
 
     def candles_history_df(self):
         return pd.DataFrame(self.candle_history)
@@ -129,7 +140,6 @@ class TutciStrategy(StrategyBase):
             ticker=self.trade_ticker,
             trading_mode=TradingMode.ISOLATED,
             order_type=OrderType.MARKET,
-
         )
         return order
 
@@ -140,48 +150,54 @@ class TutciStrategy(StrategyBase):
             ticker=self.trade_ticker,
             trading_mode=TradingMode.ISOLATED,
             order_type=OrderType.MARKET,
-
         )
         return order
 
     async def trader(self):
-        while not len(self.candle_history) == self.candle_history_length:
-            logger.warning(f'Collecting data: {len(self.candle_history)} / {self.candle_history_length}')
-            await asyncio.sleep(30)
+
+        while self.candle_history is None:
+            await asyncio.sleep(5)
 
         self.tutci_status = TutciStatus()
-        logger.warning(f'Trader started: {datetime.fromtimestamp(time.time())}')
-        self.alert_manager.send_message(f'Trader started: {datetime.fromtimestamp(time.time())}')
+        logger.warning(f'Trader started')
+        self.alert_manager.send_message(f'Trader started')
 
         while True:
             await asyncio.sleep(5)
             candles_df = self.candles_history_df()
-            long_enter, short_enter, long_exit, short_exit = tutci_online(candles_df, self.enter_length,
-                                                                          self.exit_length)
 
-            if self.tutci_status.side == Side.LONG and long_exit:
+            signals = tutci_online(candles_df, self.enter_length, self.exit_length)
+
+            if any(signals.values()):
+                _ = {k: v for k, v in signals.items() if v}
+                logger.info(f'Got signals: {_}')
+
+            if self.tutci_status.side == Side.LONG and signals['long_exit']:
                 order = self._close_long_order()
-                self.place_order(order)
+                await self.connection.place_order(order)
                 self.tutci_status.close()
 
-            elif self.tutci_status.side == Side.SHORT and short_exit:
+            elif self.tutci_status.side == Side.SHORT and signals['short_exit']:
                 order = self._close_short_order()
-                self.place_order(order)
+                await self.connection.place_order(order)
                 self.tutci_status.close()
 
             if not self.tutci_status.in_position:
-                if long_enter:
+                if signals['long_enter']:
                     order = self._open_long_order()
-                    self.place_order(order)
+                    await self.connection.place_order(order)
                     self.tutci_status.open(order)
-                elif short_enter:
+                elif signals['short_enter']:
                     order = self._open_short_order()
-                    self.place_order(order)
+                    await self.connection.place_order(order)
                     self.tutci_status.open(order)
 
-    def update_candle_history(self, candle):
+    async def update_candle_history(self, candle):
         if self.current_candle_start is None:
             self.current_candle_start = candle.datetime
+            self.candle_history = deque(
+                await self.connection.get_history_candles(ticker=self.trade_ticker, tf=self.trade_tf,
+                                                          num_bars=self.candle_history_length - 1))
             self.candle_history.append(candle)
         if self.current_candle_start == candle.datetime:
             self.candle_history[-1] = candle
@@ -191,21 +207,20 @@ class TutciStrategy(StrategyBase):
             if len(self.candle_history) > self.candle_history_length:
                 self.candle_history.popleft()
 
-    def candle_handler(self, candle: Candle):
-        self.update_candle_history(candle)
+    async def candle_handler(self, candle: Candle):
+        await self.update_candle_history(candle)
 
     def account_handler(self, account: Account):
         self.account = account
-        # self.alert_manager.send_message(account, title='account')
 
     def positions_handler(self, positions: Positions):
         self.positions = positions
-        # self.alert_manager.send_message(positions, title='positions')
 
     def order_response_handler(self, order_response: OrderResponse):
         self.alert_manager.send_message(order_response, title='order response')
+        logger.info(f'Gor order response: {order_response}')
+        pass
 
     def fill_order_handler(self, fill_order: FillOrder):
         self.alert_manager.send_message(fill_order, title='fill order')
-    # def order_cancel_response_handler(self, order_cancel_response: OrderCancelResponse):
-    #     self.alert_manager.send_message(order_cancel_response, title='order cancel response')
+        logger.info(f'Gor fill order: {fill_order}')
