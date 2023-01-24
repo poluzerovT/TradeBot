@@ -97,16 +97,16 @@ class SupertrendStatus:
             else:
                 self.trend = Trend.DOWN
 
-        if self.trend is None:
-            self.up_prev = min(self.up_prev, self.up) if not np.isnan(self.up_prev) else self.up
-            self.low_prev = max(self.low_prev, self.low) if not np.isnan(self.low_prev) else self.low
+        # if self.trend is None:
+        self.up_prev = min(self.up_prev, self.up) if not np.isnan(self.up_prev) else self.up
+        self.low_prev = max(self.low_prev, self.low) if not np.isnan(self.low_prev) else self.low
 
-        elif self.trend == Trend.UP:
+        if self.trend == Trend.UP:
             self.up_prev = np.nan
-            self.low_prev = max(self.low_prev, self.low)
+            # self.low_prev = max(self.low_prev, self.low) if not np.isnan(self.low_prev) else self.low
 
         elif self.trend == Trend.DOWN:
-            self.up_prev = min(self.up_prev, self.up)
+            # self.up_prev = min(self.up_prev, self.up) if not np.isnan(self.up_prev) else self.up
             self.low_prev = np.nan
 
     def to_dict(self):
@@ -117,6 +117,7 @@ class SupertrendStatus:
             res[k] = v
         return res
 
+
 class SupertrendStrategy(StrategyBase):
     def __init__(self, config, debug=True):
         super().__init__(config, __name__, debug)
@@ -126,15 +127,15 @@ class SupertrendStrategy(StrategyBase):
         self.trade_amount = config['supertrend']['trade_amount']
         self.trade_ticker = config['supertrend']['trade_ticker']
         self.trade_tf = config['supertrend']['timeframe']
+
         self.atr_period = config['supertrend']['atr_period']
         self.mult = config['supertrend']['mult']
-        self.ema_leng = 60
+        self.ema_leng = config['supertrend']['ema_leng']
 
         self.candle_history: deque[Candle] = deque()
         self.candle_history_length = max(self.atr_period, self.ema_leng) + 2
         self.current_candle_start = None
         self.add_sequent_task(self.set_candles_history)
-
 
     def candles_history_df(self):
         return pd.DataFrame(self.candle_history)
@@ -188,8 +189,10 @@ class SupertrendStrategy(StrategyBase):
         return order
 
     async def trader(self):
-        self.supertrend_status = SupertrendStatus(self.atr_period, self.mult)
         self.ema_trend = EmaTrend(self.ema_leng)
+        self.supertrend_status = SupertrendStatus(self.atr_period, self.mult)
+        if self.active_position is not None:
+            self.supertrend_status.trend = Trend.UP if self.active_position.side == Side.LONG else Trend.DOWN
         logger.warning(f'Trader started')
 
         while True:
@@ -204,32 +207,29 @@ class SupertrendStrategy(StrategyBase):
                 logger.warning(f'Trend changed. Global: {self.ema_trend}. Supertrend:{self.supertrend_status.trend}')
                 # close position
                 if self.active_position is not None:
-                    # if self.supertrend_status.trend_prev == Trend.UP:
-                    if self.active_position.side == Side.LONG:
+                    if self.active_position.side == Side.LONG and self.supertrend_status.trend != Trend.UP:
                         order = self._close_long_order()
                         resp = await self.connection.place_order(order)
                         if resp.status != OrderStatus.OK:
                             logger.error(f'Cant close long position: {order}, {resp}')
 
-                    elif self.active_position.side == Side.SHORT:
-                    # elif self.supertrend_status.trend_prev == Trend.DOWN:
+                    elif self.active_position.side == Side.SHORT and self.supertrend_status.trend != Trend.DOWN:
                         order = self._close_short_order()
-                        resp = await self.connection.place_order()
+                        resp = await self.connection.place_order(order)
                         if resp.status != OrderStatus.OK:
                             logger.error(f'Cant close short position: {order}, {resp}')
 
                 # open if both trends in same direction
-                if self.supertrend_status.trend == Trend.UP and self.ema_trend.trend == Trend.UP:
+                if self.supertrend_status.trend == Trend.UP:# and self.ema_trend.trend == Trend.UP:
                     order = self._open_long_order()
                     resp = await self.connection.place_order(order)
                     if resp.status != OrderStatus.OK:
                         logger.error(f'Cant open long position: {order}, {resp}')
-                elif self.supertrend_status.trend == Trend.DOWN and self.ema_trend.trend == Trend.DOWN:
+                elif self.supertrend_status.trend == Trend.DOWN:# and self.ema_trend.trend == Trend.DOWN:
                     order = self._open_short_order()
                     resp = await self.connection.place_order(order)
                     if resp.status != OrderStatus.OK:
                         logger.error(f'Cant open short position: {order}, {resp}')
-
 
     async def update_candle_history(self, candle):
         if self.candle_history is None:
@@ -251,12 +251,9 @@ class SupertrendStrategy(StrategyBase):
         self.account = account
 
     async def positions_handler(self, positions: List[Position]):
-        self.active_position = None
         for position in positions:
-            if position.instrument_id == self.trade_ticker and position.pos_size == self.trade_amount:
+            if position.instrument_id == self.trade_ticker:
                 self.active_position = position
-                logger.warning(f'Position update: {position}')
-
 
     async def order_response_handler(self, order_response: OrderResponse):
         self.alert_manager.send_message(order_response, title='order response')
