@@ -25,8 +25,6 @@ class Method(Enum):
     SET = 'SET'
 
 
-
-
 async def handle_rest_response(result: aiohttp.ClientResponse) -> Dict:
     if result.status != 200:
         error_msg = await result.text()
@@ -62,22 +60,6 @@ class OkxConnection:
         self.listening_tasks = []
         self.reconnect_task = None
 
-    # def __del__(self):
-    #     for task in self.listening_tasks:
-    #         if task:
-    #             task.cancel()
-    #     for ws in [self.public_ws, self.private_ws, self.trade_ws]:
-    #         if ws:
-    #             ws.close()
-    #
-    #     if self.reconnect_task:
-    #         self.reconnect_task.cancel()
-    #
-    #
-    #     print('destructed')
-
-    # WEBSOCKET LISTENERS
-
     # WS LISTENERS
     async def _listen_to_public_ws(self):
         while True:
@@ -93,14 +75,34 @@ class OkxConnection:
             obj = self._object_from_json_private(msg_json)
             self.queue.put_nowait(obj)
 
-    # async def _listen_to_trade_ws(self):
-    #     while True:
-    #         message = await self.trade_ws.recv()
-    #         if message == 'pong':
-    #             continue
-    #         msg_json = json.loads(message)
-    #         obj = self._object_from_json_trade(msg_json)
-    #         self.queue.put_nowait(obj)
+    # OBJECT CONVERTERS
+    def _object_from_json_public(self, msg: Dict) -> Any:
+        channel = msg['arg']['channel']
+        obj = None
+        try:
+            if channel.startswith('candle'):
+                obj = self._candle_from_json(msg)
+            else:
+                logger.error(f'Unknown message PUBLIC: {msg}')
+        except Exception as e:
+            logger.error(f'Public processing object error: \n{msg}\n{e}', )
+        return obj
+
+    def _object_from_json_private(self, msg: Dict) -> Any:
+        channel = msg['arg']['channel']
+        obj = None
+        try:
+            if channel == 'account':
+                obj = self._account_from_json(msg)
+            elif channel == 'positions':
+                obj = self._positions_from_json(msg)
+            elif channel == 'orders':
+                obj = self._fill_order_from_json(msg)
+            else:
+                logger.error(f'Unknown message PRIVATE: {msg}')
+        except Exception as e:
+            logger.error(f'Private processing object error: \n{msg}\n{e}', )
+        return obj
 
     # JSON TO STRUCTURES CONVERTERS
     def _candle_from_json(self, msg: Dict, **params) -> Any:
@@ -137,7 +139,7 @@ class OkxConnection:
         positions = []
         for data in msg['data']:
             pos = Position(
-                side=Side(data['posSide']),
+                side=Side(float(data['pos'])) if InstrumentType(data['instType']) == InstrumentType.SWAP else Side(data['posSide']),
                 margin_ccy=data['ccy'],
                 instrument_type=InstrumentType(data['instType']),
                 instrument_id=data['instId'],
@@ -171,7 +173,7 @@ class OkxConnection:
             op=msg['op'],
             order_id=msg['id'],
             status=OrderStatus.OK if msg['code'] == '0' else OrderStatus.ERROR,
-            # data=msg['data']
+            msg=msg['data'][0]['sMsg'],
         )
 
     def _multiple_order_response_from_json(self, msg: Dict) -> List[OrderResponse]:
@@ -287,45 +289,20 @@ class OkxConnection:
         }
         return json.dumps(msg, separators=(",", ":"))
 
-    # OBJECT CONVERTERS
-    def _object_from_json_public(self, msg: Dict) -> Any:
-        channel = msg['arg']['channel']
-        obj = None
-        try:
-            if channel.startswith('candle'):
-                obj = self._candle_from_json(msg)
-            else:
-                logger.error(f'Unknown message PUBLIC: {msg}')
-        except Exception as e:
-            logger.error(f'Public processing object error: \n{msg}\n{e}', )
-        return obj
-
-    def _object_from_json_private(self, msg: Dict) -> Any:
-        channel = msg['arg']['channel']
-        obj = None
-        try:
-            if channel == 'account':
-                obj = self._account_from_json(msg)
-            elif channel == 'positions':
-                obj = self._positions_from_json(msg)
-            elif channel == 'orders':
-                obj = self._fill_order_from_json(msg)
-            else:
-                logger.error(f'Unknown message PRIVATE: {msg}')
-        except Exception as e:
-            logger.error(f'Private processing object error: \n{msg}\n{e}', )
-        return obj
-
     # TRADE API
     async def place_order(self, order: Order) -> OrderResponse:
-        if not self.debug:
-            await self.trade_ws.send(self._order_to_json(order))
-            response = await self.trade_ws.recv()
-            response = json.loads(response)
-            order_response = self._order_response_from_json(response)
-            return order_response
-        logger.debug(f'Placing order: {order}')
-        return OrderResponse(OrderStatus.ERROR)
+        if self.debug:
+            order.size = 0
+        logger.warning(f'Placing order: {order}')
+        await self.trade_ws.send(self._order_to_json(order))
+        response = await self.trade_ws.recv()
+        response = json.loads(response)
+        order_response = self._order_response_from_json(response)
+        if order_response.status == OrderStatus.OK:
+            logger.warning(f'Order placed: {order_response}')
+        else:
+            logger.error(f'Order not placed: {order_response}')
+        return order_response
 
     async def place_multiple_orders(self, orders: List[Order]):
         if not self.debug:
@@ -341,7 +318,7 @@ class OkxConnection:
 
     # ACC API
     async def set_leverage(self, inst_id: str, leverage: int, margin_mode: TradingMode):
-        await self._set_leverage(instId=inst_id, lever=leverage, mgnMode=margin_mode)
+        await self._rest_set_leverage(instId=inst_id, lever=leverage, mgnMode=margin_mode)
 
     async def get_history_candles(self, ticker: str, tf: str, num_bars: int):
         candles = []
@@ -363,7 +340,7 @@ class OkxConnection:
             return instrument_info
 
     # REST API
-    async def _place_order(self, **params):
+    async def _rest_place_order(self, **params):
         if self.debug:
             logger.warning(f'Placing order: {params}')
             return
@@ -371,7 +348,7 @@ class OkxConnection:
             Method.POST, "/api/v5/trade/order", params=params
         )
 
-    async def _set_leverage(self, **params):
+    async def _rest_set_leverage(self, **params):
         """https://www.okx.com/docs-v5/en/#rest-api-account-set-leverage"""
         return await self._signed_rest_request(Method.POST, "/api/v5/account/set-leverage", params=params)
 
@@ -406,7 +383,6 @@ class OkxConnection:
             async with self.rest_session.post(f"{self.rest_url}{path}", headers=headers, json=params) as result:
                 return await handle_rest_response(result)
 
-    #  WEBSOCKET SETUP
     def _get_signature(self, method: Method, path: str, params: Dict, timestamp: str):
         if params:
             if method == Method.GET:
@@ -421,6 +397,7 @@ class OkxConnection:
         )
         return base64.b64encode(mac.digest()).decode()
 
+    #  WEBSOCKET SETUP
     def _get_login_msg(self):
         timestamp = int(time.time())
         msg = {
@@ -474,19 +451,9 @@ class OkxConnection:
         logger.warning(f'Private setup done')
 
     async def _setup_trade(self):
-        self.trade_ws = await websockets.connect(self.trade_ws_url)
+        self.trade_ws = await websockets.connect(self.trade_ws_url, ping_interval=20)
         await self._login(self.trade_ws, 'TRADE')
         logger.warning(f'Trade setup done')
-
-    async def _periodicaly_reconnect(self):
-        logger.warning(f"Created reconnect task with interval: {self.reconnect_interval} seconds")
-        while True:
-            await asyncio.sleep(self.reconnect_interval)
-            try:
-                logger.warning(f"Reconnecting according to interval: {self.reconnect_interval} seconds")
-                await self._reconnect()
-            except Exception as e:
-                logger.error(f"Failed to reconnect: {e}")
 
     async def _reconnect(self):
         try:
@@ -503,13 +470,6 @@ class OkxConnection:
         await self._setup()
         logger.debug(f"Number of current running tasks {len(asyncio.all_tasks())}")
 
-    async def _ping_trade_ws(self):
-        while True:
-            await self.trade_ws.send('ping')
-            resp = await self.trade_ws.recv()
-            # logger.warning(f'GOT PIGN RESPONSE: {resp}')
-            await asyncio.sleep(20)
-
     async def _setup(self):
         self.rest_session = aiohttp.ClientSession()
 
@@ -520,20 +480,15 @@ class OkxConnection:
         self.listening_tasks = [
             asyncio.create_task(self._listen_to_public_ws()),
             asyncio.create_task(self._listen_to_private_ws()),
-            # asyncio.create_task(self._listen_to_trade_ws()),
-            asyncio.create_task(self._ping_trade_ws()),
         ]
 
     async def run(self):
         await self._setup()
-        # self.reconnect_task = asyncio.create_task(self._periodicaly_reconnect())
 
     async def exit(self):
         await self.rest_session.close()
         for ws in [self.public_ws, self.private_ws, self.trade_ws]:
-
             await ws.close()
         for task in [*self.listening_tasks, self.reconnect_task]:
             if not task.done():
                 task.cancel()
-

@@ -31,6 +31,13 @@ class Side(Enum):
 
     @classmethod
     def _missing_(cls, value):
+        if isinstance(value, float):
+            if value > 0:
+                value = 'LONG'
+            elif value < 0:
+                value = 'SHORT'
+            else:
+                value = 'NET'
         if value in ['long']:
             value = 'LONG'
         elif value in ['short']:

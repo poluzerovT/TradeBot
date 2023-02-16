@@ -37,7 +37,7 @@ class OrderResponse:
     status: OrderStatus
     order_id: str = ''
     op: str = ''
-
+    msg: str = ''
 @dataclass
 class Order:
     action: Action
